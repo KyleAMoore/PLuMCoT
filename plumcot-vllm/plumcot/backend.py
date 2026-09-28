@@ -33,6 +33,16 @@ LogprobMode = Literal["none", "chosen", "dist"]
 LOGPROB_MODES = ("none", "chosen", "dist")
  
  
+def find_model_config(llm):
+    """The vLLM ModelConfig of an `LLM`, or None if neither known location
+    (`llm.model_config`, `llm.llm_engine.model_config`) exists. Its location
+    has moved between vLLM versions."""
+    cfg = getattr(llm, "model_config", None)
+    if cfg is None:
+        cfg = getattr(getattr(llm, "llm_engine", None), "model_config", None)
+    return cfg
+ 
+ 
 @dataclass
 class Continuation:
     token_ids: List[int]
@@ -109,7 +119,7 @@ class VLLMBackend:
         try:
             from transformers import GenerationConfig
  
-            name = model_name or self.llm.model_config.model
+            name = model_name or find_model_config(self.llm).model
             eos = GenerationConfig.from_pretrained(name).eos_token_id
             if eos is not None:
                 ids.update(eos if isinstance(eos, (list, tuple)) else [eos])
@@ -129,7 +139,16 @@ class VLLMBackend:
         if n == AUTO:
             raise ValueError('num_logprobs="auto" has not been resolved; PLuMCoT resolves '
                              "it for the generator. Give judge backends an int.")
-        cap = self.llm.model_config.max_logprobs
+        cfg = find_model_config(self.llm)
+        if cfg is None:
+            warnings.warn(
+                "Could not find the LLM's model_config (looked at llm.model_config and "
+                "llm.llm_engine.model_config), so num_logprobs cannot be checked against "
+                "max_logprobs; a mismatch will surface as a vLLM error on the first call.",
+                stacklevel=2,
+            )
+            return
+        cap = cfg.max_logprobs
         if cap == FULL_VOCAB:
             return
         if n == FULL_VOCAB or n > cap:
