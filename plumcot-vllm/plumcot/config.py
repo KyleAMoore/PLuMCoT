@@ -1,165 +1,139 @@
-"""Configuration for each PLuMCoT choice point.
-
-Configure (Stage 1.5) is currently constant: a single PLuMCoTConfig is used at
-every generation iteration. `PLuMCoT.configure()` is the hook for varying it.
+"""Loop-level configuration and logprob-count resolution.
+ 
+Only settings that are fixed for a whole generation live here: base decoding
+(the "standard generation iteration" of Algorithm 1), the stopping criterion,
+chunking and the main-loop seed. Each stage's own settings live on the stage
+object itself (plumcot.stages), so Configure can swap whole stages per
+triggered step without touching these.
+ 
+Stopping criteria are deliberately not visible to Configure: letting a
+per-step choice change when generation ends would open the door to
+non-halting behavior.
 """
 from __future__ import annotations
-
+ 
 import math
 import warnings
-from dataclasses import dataclass, field
-from typing import Literal, Optional, Tuple, Union
-
+from dataclasses import asdict, dataclass, field
+from typing import Iterable, Literal, Optional, Union
+ 
 # -- how many logprobs the backend requests per position ---------------------
 # vLLM already gives None ("no logprobs") and -1 ("full vocabulary") special
-# meanings, so matching the Filter's k uses a named sentinel instead.
-MATCH_TOP_K = "top_k"
+# meanings, so "as many as the stages need" uses a named sentinel instead.
+AUTO = "auto"
 FULL_VOCAB = -1
 MIN_RECOMMENDED_LOGPROBS = 20  # also vLLM's default max_logprobs
-
-NumLogprobs = Union[int, Literal["top_k"]]
-
-
-def resolve_num_logprobs(num_logprobs: NumLogprobs, cfg: "PLuMCoTConfig") -> int:
+ 
+NumLogprobs = Union[int, Literal["auto"]]
+ 
+ 
+@dataclass
+class DecodingConfig:
+    """The base policy: how untriggered tokens are sampled.
+ 
+    temperature: 0 is greedy. See BlendSelect for why temperature 0 is only
+        allowed together with judge_weight = 1.
+    top_k: None disables top-k (no other "off" value is accepted).
+    top_p: in (0, 1]; 1 disables top-p. Applied after temperature, over the
+        renormalized top-k, as vLLM does.
+    """
+    temperature: float = 1.0
+    top_k: Optional[int] = 50
+    top_p: float = 0.9
+ 
+    def validate(self) -> None:
+        if not (math.isfinite(self.temperature) and self.temperature >= 0.0):
+            raise ValueError(f"decoding.temperature must be finite and >= 0; got {self.temperature}")
+        if self.top_k is not None and (isinstance(self.top_k, bool)
+                                       or not isinstance(self.top_k, int) or self.top_k < 1):
+            raise ValueError(f"decoding.top_k must be None (disabled) or an int >= 1; "
+                             f"got {self.top_k!r}")
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError(f"decoding.top_p must be in (0, 1]; got {self.top_p}")
+ 
+ 
+@dataclass
+class PLuMCoTConfig:
+    """Settings held constant across every generation step.
+ 
+    max_new_tokens: stopping criterion (with the backend's stop tokens).
+    chunk_size: untriggered tokens are decoded in chunks, and each chunk is
+        truncated at the first position where the Trigger fires. This is
+        exact: the kept tokens were sampled from the base policy either way.
+    seed: seeds the main loop's random stream (chunk sampling, lookahead
+        seeds and Select's draws). None means nondeterministic.
+    """
+    decoding: DecodingConfig = field(default_factory=DecodingConfig)
+    max_new_tokens: int = 512
+    chunk_size: int = 32
+    seed: Optional[int] = None
+ 
+    def validate(self) -> None:
+        if not isinstance(self.decoding, DecodingConfig):
+            raise TypeError("config.decoding must be a DecodingConfig.")
+        self.decoding.validate()
+        for name in ("max_new_tokens", "chunk_size"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"config.{name} must be an int >= 1; got {v!r}")
+        if self.seed is not None and (isinstance(self.seed, bool) or not isinstance(self.seed, int)):
+            raise ValueError(f"config.seed must be None or an int; got {self.seed!r}")
+ 
+    def to_dict(self) -> dict:
+        return asdict(self)
+ 
+ 
+def resolve_num_logprobs(num_logprobs: NumLogprobs, config: PLuMCoTConfig,
+                         stages: Iterable[object]) -> int:
     """Turn a NumLogprobs setting into the int passed to vLLM.
-
-    "top_k" -> cfg.filter.top_k; -1 -> full vocabulary; n >= 1 -> n.
+ 
+    Every stage may declare, through `required_logprobs(config)`, how many
+    top logprobs per position it needs (None = no requirement, -1 = the full
+    vocabulary).
+ 
+      "auto" -> the largest declared requirement (-1 if any stage needs the
+                full vocabulary); an error if no stage declares one.
+      -1     -> the full vocabulary.
+      n >= 1 -> n, which must cover every declared requirement.
+ 
     Pass the result as `LLM(max_logprobs=...)` too.
     """
-    if num_logprobs == MATCH_TOP_K:
-        if cfg.filter.top_k is None or cfg.filter.top_k <= 0:
+    reqs = []
+    for s in stages:
+        r = s.required_logprobs(config)
+        if r is not None:
+            reqs.append((type(s).__name__, int(r)))
+    if num_logprobs == AUTO:
+        if not reqs:
             raise ValueError(
-                'num_logprobs="top_k" needs filter.top_k > 0; with top-k disabled, '
-                "set num_logprobs explicitly (or -1 for the full vocabulary)."
+                'num_logprobs="auto" uses the largest logprob count any stage requires, '
+                "but no stage declares one (for example, a Filter with top-k disabled). "
+                "Set num_logprobs to an int, or -1 for the full vocabulary."
             )
-        return int(cfg.filter.top_k)
+        values = [r for _, r in reqs]
+        return FULL_VOCAB if FULL_VOCAB in values else max(values)
     if isinstance(num_logprobs, bool) or not isinstance(num_logprobs, int) or (
         num_logprobs < 1 and num_logprobs != FULL_VOCAB
     ):
-        raise ValueError(f'num_logprobs must be "top_k", -1, or >= 1; got {num_logprobs!r}')
+        raise ValueError(f'num_logprobs must be "auto", -1, or >= 1; got {num_logprobs!r}')
+    if num_logprobs != FULL_VOCAB:
+        for name, r in reqs:
+            if r == FULL_VOCAB or r > num_logprobs:
+                need = "the full vocabulary (-1)" if r == FULL_VOCAB else str(r)
+                raise ValueError(
+                    f"{name} needs {need} logprobs per position but num_logprobs="
+                    f"{num_logprobs}; raise num_logprobs (and vLLM's max_logprobs) or "
+                    "change the stage."
+                )
     return num_logprobs
-
-
-@dataclass
-class TriggerConfig:
-    """Stage 1: entropy gate.
-
-    Lookahead runs only when the normalized next-token entropy H(p) / log|V|
-    is at or above `threshold`. The default is a starting point; calibrate it
-    to a target firing rate with `plumcot.engine.calibrate_threshold`.
-    """
-    enabled: bool = True
-    threshold: float = 0.15
-    # vLLM returns only the top-N logprobs, so the entropy contributed by the
-    # remaining tail mass has to be estimated:
-    #   "lumped"  - tail treated as a single token (lower bound on H)
-    #   "uniform" - tail spread evenly over the rest of the vocab (upper bound)
-    tail: Literal["lumped", "uniform"] = "lumped"
-
-
-@dataclass
-class FilterConfig:
-    """Stage 2: candidate pool = top-k, then top-p over the renormalized top-k.
-
-    The same k/p are used for ordinary (untriggered) sampling.
-    """
-    top_k: int = 50
-    top_p: float = 0.9
-    min_candidates: int = 1
-
-
-@dataclass
-class LookaheadConfig:
-    """Stage 3: the continuation generated after each candidate token."""
-    max_tokens: int = 16
-    num_samples: int = 1           # rollouts per candidate (forced to 1 when greedy)
-    temperature: float = 0.0       # 0.0 = greedy, i.e. a deterministic base-policy rollout
-    top_p: float = 1.0
-    top_k: Optional[int] = None    # None = disabled
-    stop: Tuple[str, ...] = ()     # optional stop strings, e.g. ("\n\n",)
-    # How per-sample scores combine into one score per candidate. None uses the
-    # scorer's default: "logmeanexp" for kind="logprob" scorers (with tau = 1
-    # this is log of the mean probability, log V-hat, the Bayesian estimate) and
-    # "mean" for kind="utility" scorers (risk-neutral expected utility).
-    aggregate: Optional[Literal["mean", "max", "min", "logmeanexp"]] = None
-    # tau for "logmeanexp": tau * log mean exp(score / tau), the entropic risk
-    # measure. tau > 0 is optimistic (-> "max" as tau -> 0+), tau < 0 is
-    # pessimistic (-> "min" as tau -> 0-), and |tau| -> inf recovers "mean".
-    aggregate_temperature: float = 1.0
-
-
-@dataclass
-class SelectConfig:
-    """Stage 5: choose among candidates.
-
-        P(c) ∝ p(c)^(1 - w) · exp(w · score(c)),   w = judge_weight
-
-    A log-linear (logarithmic opinion) pool of the model and the judge: the
-    minimizer of (1 - w)·KL(q‖p) + w·KL(q‖q_S), where q_S ∝ exp(score).
-    Equivalently, a Boltzmann choice over the blended utility
-    U(c) = (1 - w)·log p(c) + w·score(c): the immediate term (how natural
-    the token is, in nats) against the lookahead's value.
-
-    w = 0 is plain decoding over the filtered candidates; w = 1 selects on
-    the score alone (a uniform prior over the filtered candidates).
-
-    With score = log P(ok | c) (a kind="logprob" scorer), this is a tempered
-    Bayesian update: p(c)^(1-w)·P(ok|c)^w = [p(c)·P(ok|c)^k]^(1-w) with
-    evidence weight k = w / (1 - w), sampled at temperature 1 / (1 - w).
-    w = 0.5 gives exact Bayesian MAP in argmax mode.
-    """
-    mode: Literal["sample", "argmax"] = "sample"
-    judge_weight: float = 0.5
-
-
-@dataclass
-class PLuMCoTConfig:
-    trigger: TriggerConfig = field(default_factory=TriggerConfig)
-    filter: FilterConfig = field(default_factory=FilterConfig)
-    lookahead: LookaheadConfig = field(default_factory=LookaheadConfig)
-    select: SelectConfig = field(default_factory=SelectConfig)
-    # Temperature for ordinary (untriggered) sampling.
-    temperature: float = 1.0
-    max_new_tokens: int = 512
-    # Untriggered tokens are decoded in chunks, and each chunk is truncated at
-    # the first position where the trigger fires. This is exact: the kept
-    # tokens were sampled from the standard policy either way.
-    chunk_size: int = 32
-    seed: Optional[int] = None
-
-    def validate(self, num_logprobs: int) -> None:
-        """`num_logprobs` is the resolved per-position logprob count (see
-        resolve_num_logprobs); -1 means the full vocabulary."""
-        full = num_logprobs == FULL_VOCAB
-        top_k_on = self.filter.top_k is not None and self.filter.top_k > 0
-        if not full and top_k_on and self.filter.top_k > num_logprobs:
-            raise ValueError(
-                f"filter.top_k={self.filter.top_k} exceeds num_logprobs={num_logprobs}; "
-                "raise num_logprobs (and vLLM's max_logprobs) or lower top_k."
-            )
-        if not full and not top_k_on:
-            warnings.warn(
-                f"filter.top_k is disabled, so top-p is computed over only the top "
-                f"{num_logprobs} tokens and the candidate pool may be truncated.",
-                stacklevel=3,
-            )
-        if not full and num_logprobs < MIN_RECOMMENDED_LOGPROBS:
-            warnings.warn(
-                f"num_logprobs={num_logprobs} is below {MIN_RECOMMENDED_LOGPROBS}. The "
-                "entropy Trigger and entropy-based scores see only the top "
-                f"{num_logprobs} tokens, which can make PLuMCoT's behavior, and its "
-                "improvement over base decoding, less reliable.",
-                stacklevel=3,
-            )
-        if not 0.0 < self.filter.top_p <= 1.0:
-            raise ValueError("filter.top_p must be in (0, 1].")
-        if not 0.0 <= self.select.judge_weight <= 1.0:
-            raise ValueError("select.judge_weight must be in [0, 1].")
-        tau = self.lookahead.aggregate_temperature
-        if not math.isfinite(tau) or tau == 0.0:
-            raise ValueError("lookahead.aggregate_temperature must be finite and nonzero "
-                             "(negative values give a pessimistic soft-min).")
-        if self.lookahead.aggregate not in (None, "mean", "max", "min", "logmeanexp"):
-            raise ValueError(f"unknown lookahead.aggregate {self.lookahead.aggregate!r}")
-        if self.chunk_size < 1 or self.lookahead.max_tokens < 1:
-            raise ValueError("chunk_size and lookahead.max_tokens must be >= 1.")
+ 
+ 
+def warn_if_few_logprobs(num_logprobs: int) -> None:
+    if num_logprobs != FULL_VOCAB and num_logprobs < MIN_RECOMMENDED_LOGPROBS:
+        warnings.warn(
+            f"num_logprobs={num_logprobs} is below {MIN_RECOMMENDED_LOGPROBS}. The "
+            "entropy Trigger and entropy-based scores see only the top "
+            f"{num_logprobs} tokens, which can make PLuMCoT's behavior, and its "
+            "improvement over base decoding, less reliable.",
+            stacklevel=3,
+        )
