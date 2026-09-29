@@ -6,8 +6,17 @@ stage is a pluggable object; the engine only sequences them.
 ```
 pip install vllm numpy        # tests need only numpy + pytest
 python examples/run_demo.py --scorer loglik
-pytest tests/
+pytest tests/                                          # fake backend; no GPU
+PLUMCOT_TEST_MODEL=Qwen/Qwen2.5-0.5B-Instruct pytest tests/   # adds real-vLLM tests
 ```
+ 
+Tests are one file per `plumcot/` module (`test_config.py`, `test_dist.py`,
+`test_stages.py`, `test_scorers.py`, `test_engine.py`, `test_backend.py`,
+`test_base.py`). Tests marked `vllm`, and the real-model parametrization of the
+engine invariants, are skipped unless `PLUMCOT_TEST_MODEL` is set; see
+`tests/conftest.py` for the other environment variables. `test_evals.py`,
+`test_eval_wiring.py` and `test_fake_backend.py` cover the eval harness and
+the test helpers.
  
 ## Layout
  
@@ -167,6 +176,7 @@ Two settings make the scores mean the same thing across scorers:
   scorers. An explicit mode overrides it. `temperature` τ sets risk attitude
   for `logmeanexp`: τ > 0 is optimistic (toward `max`), τ < 0 pessimistic
   (toward `min`), and |τ| → ∞ gives the mean.
+ 
 Command-line flags: `--judge-weight`, `--aggregate`, `--aggregate-temp`,
 `--temperature`, `--top-k`, `--top-p` (in `examples/run_demo.py` and
 `evals/safety_eval.py`).
