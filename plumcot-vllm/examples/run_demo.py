@@ -69,6 +69,10 @@ def parse_args():
     ap.add_argument("--num-logprobs", type=_num_logprobs, default="auto",
                     help='"auto" (what the stages need), -1 (full vocabulary), or an int')
     ap.add_argument("--gpu-mem", type=float, default=None)
+    ap.add_argument("--dtype", default="auto",
+                    help='model dtype for vLLM, e.g. "half" on GPUs without bfloat16 (T4)')
+    ap.add_argument("--max-model-len", type=int, default=None,
+                    help="cap the context length (and so the KV cache vLLM reserves)")
     ap.add_argument("--calibrate", type=float, default=None, metavar="RATE")
     return ap.parse_args()
  
@@ -102,8 +106,9 @@ def main():
     separate_judge = judge_name is not None and judge_name != args.model
     gen_mem = args.gpu_mem or (0.45 if separate_judge else 0.85)
  
+    llm_kw = dict(dtype=args.dtype, max_model_len=args.max_model_len)
     gen_llm = LLM(args.model, max_logprobs=num_logprobs,
-                  enable_prefix_caching=True, gpu_memory_utilization=gen_mem)
+                  enable_prefix_caching=True, gpu_memory_utilization=gen_mem, **llm_kw)
     gen = VLLMBackend(gen_llm, num_logprobs=num_logprobs, model_name=args.model)
  
     if args.calibrate is not None:
@@ -121,7 +126,7 @@ def main():
         # Two vLLM engines can share one process; if this fails on your
         # setup, serve the judge separately and wrap it in your own Backend.
         judge_llm = LLM(judge_name, max_logprobs=20, enable_prefix_caching=True,
-                        gpu_memory_utilization=0.4)
+                        gpu_memory_utilization=0.4, **llm_kw)
         judge = VLLMBackend(judge_llm, num_logprobs=20, model_name=judge_name)
  
     if args.scorer == "loglik":
